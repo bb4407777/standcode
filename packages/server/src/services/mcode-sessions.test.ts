@@ -5,7 +5,15 @@ import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
-import { claimMcodeSessionId, isMcodeSession, mcodeEntries, readMcdeTranscript, readMcodeLiveTranscript } from './mcode-sessions'
+import { trafficStateFromMessages } from '../../../shared/traffic'
+import {
+  claimMcodeSessionId,
+  isMcodeSession,
+  mcodeEntries,
+  mcodeTrafficSnapshot,
+  readMcdeTranscript,
+  readMcodeLiveTranscript,
+} from './mcode-sessions'
 
 const SID = 'mvs_0123456789abcdef0123456789abcdef'
 
@@ -261,4 +269,45 @@ test('isMcodeSession：认 mcode 命令与 harness', () => {
   assert.equal(isMcodeSession('/bin/zsh'), false)
   assert.equal(isMcodeSession('/Users/gao/code/areco/bin/dsh-trae-chat'), false)
   assert.equal(isMcodeSession('/bin/zsh', 'mcode'), true)
+})
+
+test('mcode 红绿灯快照：末条 assistant 正文 = 已出结论，末条 user = 还在跑', () => {
+  const startedAt = Date.now()
+  const { db, obs } = liveFixture([{ id: LIVE_SID, cwd: '/Users/gao', createdAt: startedAt }])
+  try {
+    const conn = new DatabaseSync(db)
+    const add = (role: string, content: string) =>
+      conn
+        .prepare('INSERT INTO local_runtime_message_rows (session_id,msg_id,role,created_at_ms,data_json) VALUES (?,?,?,?,?)')
+        .run(LIVE_SID, `m${Math.random()}`, role, startedAt, JSON.stringify({ msg_content: content }))
+    add('user', '第一句')
+    add('assistant', '答完了')
+    conn.close()
+    withEnv({ ARECO_MCODE_DB: db, ARECO_MCODE_OBS_DIR: obs }, () => {
+      // 空会话没有消息 → 不给快照（保持调用方当前状态，别把刚提交的红灯压成绿灯）
+      const empty = mcodeTrafficSnapshot(OTHER_SID)
+      assert.equal(empty, null)
+
+      const snap = mcodeTrafficSnapshot(LIVE_SID)
+      assert.ok(snap)
+      assert.equal(snap.lastMessage?.role, 'assistant')
+      assert.equal(trafficStateFromMessages([snap.lastMessage!]), 'conclusion')
+
+      // 指纹随内容变化（行内容原地更新也要变，否则红绿灯不更新）
+      const fp1 = snap.fingerprint
+      const conn2 = new DatabaseSync(db)
+      conn2
+        .prepare('INSERT INTO local_runtime_message_rows (session_id,msg_id,role,created_at_ms,data_json) VALUES (?,?,?,?,?)')
+        .run(LIVE_SID, 'mz', 'user', startedAt + 1, JSON.stringify({ msg_content: '又一句' }))
+      conn2.close()
+      const snap2 = mcodeTrafficSnapshot(LIVE_SID)
+      assert.ok(snap2)
+      assert.notEqual(snap2.fingerprint, fp1)
+      assert.equal(snap2.lastMessage?.role, 'user')
+      // 用户刚发消息 → 还在跑（红灯），不能被当成 assistant 判成绿灯
+      assert.equal(trafficStateFromMessages([snap2.lastMessage!]), 'working')
+    })
+  } finally {
+    fs.rmSync(path.dirname(db), { recursive: true, force: true })
+  }
 })

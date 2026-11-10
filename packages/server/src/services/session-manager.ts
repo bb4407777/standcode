@@ -27,8 +27,9 @@ import {
   workbuddyProjectSlugs,
 } from './agent-transcript'
 import { duplicateBindingVictims, nativeSessionOccupied } from './session-dedup'
-import { claimMcodeSessionId, isMcodeSession } from './mcode-sessions'
+import { claimMcodeSessionId, isMcodeSession, mcodeTrafficSnapshot } from './mcode-sessions'
 import { isTopicContinuation, NameTracker, nameCandidateOf } from './session-namer'
+import { trafficStateFromMessages } from '../../../shared/traffic'
 import { createLogger } from '../logger'
 import { transcriptPath } from './transcript'
 import { readClaudeTrafficState, transcriptFingerprint } from './traffic-monitor'
@@ -654,6 +655,13 @@ export class SessionManager extends EventEmitter {
     for (const session of this.sessions.values()) {
       if (!session.isRunning) continue
       try {
+        // mcode：TUI 空闲时仍持续重绘（状态行刷新，实测空闲 30 秒仍输出 464 字节），
+        // 「终端静默 15s 即闲」兜底因此永不触发 → 停下来还一直红灯（2026-11-10 报障）。
+        // 改按对话正文判定：mcode 有本地库消息源，末条 assistant 正文 = 已出结论（绿灯）。
+        if (this.isMcodeSession(session)) {
+          this.refreshMcodeTrafficState(session)
+          continue
+        }
         const source = this.trafficSnapshot(session)
         if (!source || this.trafficFingerprints.get(session.id) === source.fingerprint) {
           // 裸回车/粘贴触发的 working：transcript 2s 无动静说明没起任务，按现尾部重算兜底
@@ -762,6 +770,33 @@ export class SessionManager extends EventEmitter {
         }
       }
     }
+  }
+
+  /**
+   * mcode 红绿灯：读本地库正文，按末条消息判状态（与 agent-transcript 同口径）。
+   * 认领到原生会话前（启动期）退回终端静默兜底；一条消息都没有时不改状态，
+   * 免得把用户刚提交的红灯压成绿灯。
+   */
+  private refreshMcodeTrafficState(session: Session): void {
+    const id = session.agentSessionId
+    if (!id) {
+      if (session.trafficState === 'working' && Date.now() - session.lastOutputAt > 15_000) {
+        session.setTrafficState('idle')
+      }
+      return
+    }
+    const snap = mcodeTrafficSnapshot(id)
+    if (!snap) return
+    if (this.trafficFingerprints.get(session.id) === snap.fingerprint) return
+    // 判定只看末条消息（trafficStateFromMessages 同口径：末条 assistant 正文 = 已出结论）
+    session.setTrafficState(trafficStateFromMessages(snap.lastMessage ? [snap.lastMessage] : []))
+    this.trafficFingerprints.set(session.id, snap.fingerprint)
+  }
+
+  /** 会话是不是 mcode（命令 basename 或模板 harness） */
+  private isMcodeSession(session: Session): boolean {
+    const template = this.templates.get(session.templateId)
+    return isMcodeSession(session.command, template?.harness)
   }
 
   private trafficSnapshot(

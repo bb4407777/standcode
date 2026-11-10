@@ -4,10 +4,13 @@
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
+import { computed, watch } from 'vue'
 import type { ServerMsg } from '../../../shared/protocol'
 import { wsClient } from '../ws'
 import { useUiStore } from '../stores/ui'
+import { useSessionsStore } from '../stores/sessions'
 import { escapeDetail, logInput } from '../utils/inputLog'
+import { terminalThemeFor } from '../utils/terminalTheme'
 
 const DARK_TERM_THEME = {
   background: '#101014',
@@ -60,6 +63,15 @@ const LIGHT_TERM_THEME = {
 
 export function useTerminal(sessionId: string) {
   const ui = useUiStore()
+  const sessions = useSessionsStore()
+  // 该会话的 agent 是否只渲染深色配色 → 终端底强制深色（不跟 areco 全局浅/深主题）
+  const darkOnlyTerminal = computed(
+    () => terminalThemeFor(sessions.byId(sessionId)?.command, 'light') === 'dark',
+  )
+  const themeFor = (mode: 'dark' | 'light') =>
+    terminalThemeFor(sessions.byId(sessionId)?.command, mode) === 'dark'
+      ? DARK_TERM_THEME
+      : LIGHT_TERM_THEME
   let term: Terminal | null = null
   let fit: FitAddon | null = null
   let container: HTMLElement | null = null
@@ -481,7 +493,7 @@ export function useTerminal(sessionId: string) {
       cursorBlink: true,
       allowProposedApi: true,
       macOptionIsMeta: true,
-      theme: ui.theme === 'light' ? LIGHT_TERM_THEME : DARK_TERM_THEME,
+      theme: themeFor(ui.theme),
     })
     fit = new FitAddon()
     term.loadAddon(fit)
@@ -795,8 +807,13 @@ export function useTerminal(sessionId: string) {
 
   function setColorTheme(mode: 'dark' | 'light') {
     if (!term) return
-    term.options.theme = mode === 'light' ? LIGHT_TERM_THEME : DARK_TERM_THEME
+    term.options.theme = themeFor(mode)
   }
+
+  // 会话信息后到（store 异步）时补一次主题纠正：深色专属 agent 落到浅色终端上就是看不清
+  watch(darkOnlyTerminal, () => {
+    if (term) term.options.theme = themeFor(ui.theme)
+  })
 
   function focus() {
     term?.focus()

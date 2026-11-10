@@ -7,6 +7,7 @@ import type { Template } from '../../../shared/protocol'
 import type { AppConfig } from '../config'
 import { saveConfig } from '../config'
 import { createLogger } from '../logger'
+import { isMcodeSession } from './mcode-sessions'
 import { resolveStandCode } from './standcode-resolver'
 
 const log = createLogger('templates')
@@ -155,6 +156,10 @@ export function buildSpawnSpec(
       if (v !== undefined) env[k] = v
     }
   }
+  // mcode 靠 OSC 11 / COLORFGBG 探测终端底色：xterm.js 不应答 OSC 11，它会 fallback 深色
+  // （自绘配色按深底设计，白底上正文对比度只有 1.45）。客户端对这类 agent 强制深色终端，
+  // 这里再明确告知「终端是深底」，两边一致——免得将来 mcode 探测逻辑变了配色与底色错配。
+  if (isMcodeSession(template.command, template.harness)) env.COLORFGBG = '15;0'
   // harness.pre：exec 前的前置命令（如 reasonix 的 config auto-plan on），
   // 原样拼接——来源是本机 standcode/config 配置文件，与 command 同信任级。
   const script = resolved?.pre?.length

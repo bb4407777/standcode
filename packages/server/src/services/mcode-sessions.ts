@@ -273,6 +273,14 @@ function readMcodeMessages(id: string): TranscriptMessage[] {
   const db = openDb()
   if (!db) return []
   try {
+    return readMcodeMessagesFrom(db, id)
+  } finally {
+    safeClose(db)
+  }
+}
+
+function readMcodeMessagesFrom(db: DatabaseSync, id: string): TranscriptMessage[] {
+  try {
     const rows = db
       .prepare(
         `SELECT role, created_at_ms, data_json
@@ -289,6 +297,49 @@ function readMcodeMessages(id: string): TranscriptMessage[] {
     return messages
   } catch {
     return []
+  }
+}
+
+/** 红绿灯快照：正文条数 + 末行指纹（行内容原地更新时指纹也要变） */
+export interface McodeTrafficSnapshot {
+  fingerprint: string
+  /** 末条消息（红绿灯判定只看末条，不需要整份正文） */
+  lastMessage: TranscriptMessage | null
+}
+
+/**
+ * 红绿灯判定源：读本地库正文，按末条消息判状态（与 agent-transcript 同口径）。
+ * mcode 的 TUI 空闲时仍持续重绘（状态行刷新，实测空闲 30 秒仍输出 464 字节），
+ * 「终端静默 15 秒即闲」兜底因此永不触发 → 红灯卡死（2026-11-10 报障）。
+ * 一条消息都没有时不返回快照（保持调用方当前状态，别把刚提交的红灯压成绿灯）。
+ */
+export function mcodeTrafficSnapshot(id: string): McodeTrafficSnapshot | null {
+  if (!MCODE_SESSION_ID.test(id)) return null
+  const db = openDb()
+  if (!db) return null
+  try {
+    const stat = db
+      .prepare(
+        `SELECT COUNT(*) AS n, MAX(id) AS max_id
+           FROM local_runtime_message_rows
+          WHERE session_id = ?`
+      )
+      .get(id) as unknown as { n: number; max_id: number } | undefined
+    if (!stat || !stat.n) return null
+    const last = db
+      .prepare(
+        `SELECT id, role, created_at_ms, data_json
+           FROM local_runtime_message_rows
+          WHERE session_id = ?
+          ORDER BY id DESC LIMIT 1`
+      )
+      .get(id) as unknown as { id: number; role: string | null; created_at_ms: number; data_json: string } | undefined
+    const tail = last ? crypto.createHash('sha1').update(last.data_json).digest('hex').slice(0, 12) : ''
+    // role 必须带出来：末行是 user 时要判成「刚提交、还在跑」（红灯），不能当 assistant 判成绿灯
+    const lastMessage = last ? toMessage(last) : null
+    return { fingerprint: `${stat.n}:${stat.max_id}:${tail}`, lastMessage }
+  } catch {
+    return null
   } finally {
     safeClose(db)
   }
