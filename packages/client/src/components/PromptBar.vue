@@ -30,8 +30,8 @@ watch(text, (v) => ui.setDraft(props.sessionId, v))
 
 const sending = ref(false)
 
-async function send() {
-  if (props.disabled || sending.value) return
+async function send(): Promise<boolean> {
+  if (props.disabled || sending.value) return false
   const value = text.value
   sending.value = true
   // 等服务端回执再清输入框：没送到（断线/假连接/回执超时）就留着原文，不再静默丢字
@@ -39,11 +39,12 @@ async function send() {
   sending.value = false
   if (!ok) {
     message.warning('这条没送出去，内容还在输入框里——连接已重置，再按一次发送')
-    return
+    return false
   }
   if (value.trim()) ui.rememberPrompt(value)
   text.value = ''
   historyIndex.value = -1
+  return true
 }
 
 const promptInput = ref<HTMLTextAreaElement | null>(null)
@@ -58,7 +59,8 @@ function autoGrow() {
 }
 watch(text, () => nextTick(autoGrow))
 
-// 语音输入：按钮在附件左边；识别结果只写进输入框，不自动发送
+// 语音输入：按钮在附件左边。说完一句（VAD 断句出 final）即自动发送，与 Hermes-live 一致；
+// 收音不停，可以接着往下说，一句一条消息。没发出去就把文字留在输入框里
 const {
   listening: voiceListening,
   starting: voiceStarting,
@@ -69,6 +71,11 @@ const {
     text.value = value
   },
   onError: (msg) => message.error(msg),
+  onUtterance: async (value) => {
+    if (!value.trim()) return false
+    text.value = value
+    return await send()
+  },
 })
 
 async function onMicClick() {
