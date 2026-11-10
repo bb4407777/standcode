@@ -82,8 +82,15 @@ const {
 })
 
 async function onMicClick() {
+  // 播报中不开口：扬声器正响，这会儿开麦只会把自己的声音录回去。
+  // 记下「等念完要听」，播完自动开，不用再点一次
+  if (!voiceListening.value && speech.playingId) {
+    resumeAfterSpeech = true
+    message.info('正在播报，念完自动开始收音')
+    return
+  }
   // 手动点按钮＝用户自己掌机：取消「播报结束自动续听」，免得松手后又被拉起来
-  pausedBySpeech = false
+  resumeAfterSpeech = false
   if (resumeTimer !== null) {
     clearTimeout(resumeTimer)
     resumeTimer = null
@@ -98,7 +105,7 @@ async function onMicClick() {
 // 播报期间暂停收音：TTS 从扬声器出来会被麦克风原样录回去（自问自答 + 打断），
 // 念完再自动恢复——这就是 Hermes-live 那套半双工，用户全程不用碰屏幕
 const speech = useSpeechStore()
-let pausedBySpeech = false
+let resumeAfterSpeech = false
 let resumeTimer: number | null = null
 
 watch(
@@ -110,17 +117,17 @@ watch(
     }
     if (playingId) {
       if (voiceListening.value && !voiceStarting.value) {
-        pausedBySpeech = true
+        resumeAfterSpeech = true
         void stopVoice()
       }
       return
     }
-    if (!pausedBySpeech) return
+    if (!resumeAfterSpeech) return
     // 句与句之间 playingId 会短暂清零，等一拍再收口，别把正常停顿当成播完
     resumeTimer = window.setTimeout(() => {
       resumeTimer = null
-      if (!pausedBySpeech) return
-      pausedBySpeech = false
+      if (!resumeAfterSpeech) return
+      resumeAfterSpeech = false
       if (props.disabled || voiceListening.value || voiceStarting.value) return
       void startVoice().catch((err) => {
         message.error(err instanceof Error ? err.message : String(err))
@@ -131,6 +138,13 @@ watch(
 
 onBeforeUnmount(() => {
   if (resumeTimer !== null) clearTimeout(resumeTimer)
+})
+
+// 兜一手竞态：点麦时正好还没出声音、连上时播报已经开始——一收音就立刻收掉，别录自己
+watch(voiceListening, (listening) => {
+  if (!listening || !speech.playingId) return
+  resumeAfterSpeech = true
+  void stopVoice()
 })
 
 // 文件拖放/选件上传（document 级拖放 + 文件夹递归 + 落盘回填），逻辑在 useFileDrop
