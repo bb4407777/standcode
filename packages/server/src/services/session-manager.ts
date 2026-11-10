@@ -27,6 +27,7 @@ import {
   workbuddyProjectSlugs,
 } from './agent-transcript'
 import { duplicateBindingVictims, nativeSessionOccupied } from './session-dedup'
+import { claimMcodeSessionId, isMcodeSession } from './mcode-sessions'
 import { isTopicContinuation, NameTracker, nameCandidateOf } from './session-namer'
 import { createLogger } from '../logger'
 import { transcriptPath } from './transcript'
@@ -280,7 +281,30 @@ export class SessionManager extends EventEmitter {
           })
     )
     this.persist()
+    // mcode：原生会话 id 无法预先注入（mcode --session 只认已存在的 id），只能进程起来后
+    // 按 cwd+启动时刻认领一次并钉死 ——「恢复对话」才有凭据，对话视图也不必每次重认。
+    if (isMcodeSession(template.command, template.harness)) this.scheduleMcodeBinding(session)
     return session.toSummary()
+  }
+
+  /** mcode 活会话认领：进程起来后本地库才有原生会话行（实测 1～4 秒），认领到即钉死 agentSessionId */
+  private scheduleMcodeBinding(session: Session): void {
+    const tryBind = (attempt: number) => {
+      if (!this.sessions.has(session.id) || session.agentSessionId) return
+      const id = claimMcodeSessionId({
+        cwd: session.cwd,
+        startedAt: session.startedAt ?? session.createdAt,
+        pid: session.pid,
+        bindingHash: session.agentBindingHash,
+      })
+      if (id) {
+        session.bindAgentSession(id)
+        log.info(`认领 mcode 原生会话 ${session.id.slice(0, 8)} ↔ ${id}`)
+        return
+      }
+      if (attempt < 8) setTimeout(() => tryBind(attempt + 1), 3000)
+    }
+    setTimeout(() => tryBind(0), 3000)
   }
 
   get(id: string): Session {
@@ -324,7 +348,16 @@ export class SessionManager extends EventEmitter {
     let resumedTraffic: { state: Exclude<TrafficState, 'exited'>; fingerprint: string } | null = null
     if (resume) {
       const kind = this.agentKind(session)
-      if (session.claudeSessionId) {
+      if (isMcodeSession(session.command, template.harness)) {
+        // mcode 只认「已存在」的会话 id（实测：注入新 id 报 Session not found）——
+        // 认领到的 mvs id 就是恢复凭据：mcode --session <mvs id> 恢复同一会话，消息续写同一行集
+        const sid = session.agentSessionId || ''
+        if (sid) {
+          session.bindAgentSession(sid)
+          extraArgs = ['--session', sid]
+          didResume = true
+        }
+      } else if (session.claudeSessionId) {
         resumeClaude = true
         didResume = true
       } else if (kind === 'reasonix') {
@@ -416,6 +449,8 @@ export class SessionManager extends EventEmitter {
       session.setTrafficState(resumedTraffic.state)
       this.trafficFingerprints.set(session.id, resumedTraffic.fingerprint)
     }
+    // mcode 重启 = 新进程新原生会话（非恢复重启已清绑定）→ 重新认领一次；恢复重启绑定还在，跳过
+    if (isMcodeSession(session.command, template.harness)) this.scheduleMcodeBinding(session)
     this.persist()
     this.emit('epoch', session.id)
     return session.toSummary()

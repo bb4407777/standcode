@@ -30,7 +30,7 @@ import {
   resolveQoderSessionFile,
 } from '../services/history'
 import { chatlogCwd, isChatlogSource, readChatlogTranscript } from '../services/chatlog'
-import { readMcdeTranscript } from '../services/mcode-sessions'
+import { isMcodeSession, readMcdeTranscript, readMcodeLiveTranscript } from '../services/mcode-sessions'
 import { sweepForDir } from '../services/dir-sweep'
 
 // 与 history.ts 的 SAFE_SEGMENT 同规则：单段路径只允许安全字符（本地副本，history.ts 未导出该常量）
@@ -463,12 +463,19 @@ export class ApiControllers {
       const beforeRaw = Number(ctx.query.before)
       const before = Number.isFinite(beforeRaw) && beforeRaw >= 0 ? beforeRaw : undefined
       const cursor = Math.max(0, Number(ctx.query.cursor ?? 0) || 0)
+      const template = this.templates.get(session.templateId)
+      // mcode（MiniMax Code CLI）：对话正文落在自家本地 sqlite，不是 claude 布局——单开一支读，
+      // 走 claude 布局分支只会找不到文件、对话视图空白（2026-11-10 实测报障）。
+      if (isMcodeSession(session.command, template?.harness)) {
+        ok(ctx, readMcodeLiveTranscript(session, { cursor, before }))
+        return
+      }
       // 定位 transcript 文件：claude 系按 --session-id 直取；在册 agent（codex/codebuddy/
       // reasonix 等）自家落盘解析必须先于 transcriptDir——自动探测会误命中在册 agent 的
       // 同名目录（codebuddy → ~/.codebuddy/projects 是 codebuddy 自家格式，按 claude 布局
       // 解析必得 0 条，2026-07-27 workbuddy 对话模式空白报障）；其余 claude 布局衍生 CLI
       //（qoder 等）走 transcriptDir，缺 claudeSessionId 的 claude 包装器按时间窗兜底
-      const kind = agentKindOf(session.command, this.templates.get(session.templateId)?.harness)
+      const kind = agentKindOf(session.command, template?.harness)
       if (kind && !session.claudeSessionId) {
         ok(ctx, readAgentTranscript(session, kind, { cursor, before }))
         return
@@ -479,7 +486,6 @@ export class ApiControllers {
       } else if (session.transcriptDir) {
         filePath = locateClaudeLayoutTranscript(session, session.transcriptDir)
       } else {
-        const template = this.templates.get(session.templateId)
         const home = template ? effectiveClaudeHome(template) : null
         filePath = home ? locateClaudeTranscript(session, home) : null
       }

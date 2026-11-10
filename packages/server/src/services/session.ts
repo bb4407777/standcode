@@ -29,6 +29,14 @@ const DEFAULT_ROWS = 30
  */
 const LINE_DISPATCH_HARNESSES = new Set(['workbuddy-stand', 'openclaw'])
 
+/**
+ * 输入框提示符：'>'（claude/codex 系）、'❯'、'›'（mcode TUI，U+203A）。
+ * 认不出提示符 = 认不出输入框 = 提交逻辑退化成盲按回车，5 分钟能补按几十次，
+ * 把用户正在打的字抢先发出去（2026-11-10 mcode 实测：服务日志「补按 47 次」）。
+ */
+const INPUT_PROMPT_RE = /^\s*[>❯›](\s|$)/
+const INPUT_PROMPT_STRIP_RE = /^\s*[>❯›]\s?/
+
 export interface SessionSnapshot {
   epoch: number
   data: string
@@ -310,10 +318,14 @@ export class Session extends EventEmitter {
     }
     // 写正文这一刻输入框是否已经画出来：没画出来（恢复会话重放首屏/启动画面）时正文会被
     // TUI 丢掉，后面要凭这个标记补写一次——必须在这里取，不能等几秒后再判。
-    const boxAtWrite = this.inputBoxText() !== null
+    // 连输入框正文一起留快照：空框时 TUI 会显示占位提示语（mcode 的「Ask Mcode to do anything」），
+    // 提交后框又变回同一句占位语——「框内容 == 写入前」= 我们的字没落地 / 已提交，
+    // 不能当成「有内容却认不出尾字」反复盲按回车（会把用户正在打的字也发出去，2026-11-10 实测）。
+    const boxBefore = this.inputBoxText()
+    const boxAtWrite = boxBefore !== null
     // markWorking:false —— working 态本方法已显式置好，且 body 已无尾回车不触发 write 拆分
     if (body) this.write(body, { markWorking: false })
-    this.writeEnterWhenSettled(body, boxAtWrite)
+    this.writeEnterWhenSettled(body, boxAtWrite, boxBefore)
     this.promptCount += 1
     if (!this.agentSessionId) this.setAgentBindingPrompt(text)
     // 占位名会话：第一句话即会话名（与历史对话标题同口径）。程序化注入（交接档案提示等）传 autoName:false 跳过。
@@ -337,7 +349,7 @@ export class Session extends EventEmitter {
    * ENTER_QUIET_MS 远小于 onceQuiet 的首屏 1200ms：只需跨过 TUI 的粘贴合帧窗口（实测数十 ms）。
    * ENTER_MAX_WAIT_MS 兜底：持续输出的会话不会让回车无限拖着不发。
    */
-  private writeEnterWhenSettled(body = '', boxAtWrite = true) {
+  private writeEnterWhenSettled(body = '', boxAtWrite = true, boxBefore: string | null = null) {
     const snippet = body.replace(/\s+/g, ' ').trim().slice(-8)
     // 长 prompt（带附件的长路径等）TUI 逐字回显要好几秒，固定 2s 上限会在还在"粘贴"时
     // 就把回车塞进去、被判成换行（2026-11-08 报障的形态）。上限随长度放宽到 8s。
@@ -352,7 +364,7 @@ export class Session extends EventEmitter {
       // 还没画完时按下去只会变成换行（2026-11-09 报障，见该方法注释）。
       const accepted = snippet.length < 2 || this.inputBoxHasTail(snippet)
       if ((quietFor >= Session.ENTER_QUIET_MS && accepted) || waited >= maxWait) {
-        this.submitUntilAccepted(snippet, body, !boxAtWrite)
+        this.submitUntilAccepted(snippet, body, !boxAtWrite, boxBefore)
         return
       }
       setTimeout(tryFire, Session.ENTER_QUIET_MS)
@@ -369,7 +381,7 @@ export class Session extends EventEmitter {
    * 「用户确认是否在线」实锤，用户手动补了回车）。所以窗口放宽到 5 分钟、间隔逐步放慢；
    * 每次按键前都要求输入框里仍是刚写入的尾字，已提交（框里没了）立刻收手。
    */
-  private submitUntilAccepted(snippet: string, body = '', boxAbsentAtWrite = false) {
+  private submitUntilAccepted(snippet: string, body = '', boxAbsentAtWrite = false, boxBefore: string | null = null) {
     const gen = ++this.enterGen
     const startedTs = Date.now()
     const deadline = startedTs + 300_000
@@ -378,6 +390,9 @@ export class Session extends EventEmitter {
     let rewrites = 0
     let lastPressAt = 0
     let lastRewriteAt = 0
+    // 写入前的输入框正文（去空白）：空框占位语与「我们的字没落地」都表现为
+    // 「框内容 == 写入前」，据此把占位符框当空框处理
+    const flatBefore = boxBefore === null ? null : boxBefore.replace(/\s+/g, '')
     /**
      * 补回车。默认要求 pty 已安静一小段再按：TUI 还在重绘（恢复会话重放首屏）时，
      * 回车会跟残帧并成一次粘贴、沦为换行——这正是「按住回车只出换行、命令发不出去」的形态
@@ -410,8 +425,13 @@ export class Session extends EventEmitter {
     const tick = () => {
       if (!this.isRunning || gen !== this.enterGen) return
       const box = this.inputBoxText()
-      const flatBox = box === null ? null : box.replace(/\s+/g, '')
+      let flatBox = box === null ? null : box.replace(/\s+/g, '')
       const flatSnippet = snippet.replace(/\s+/g, '')
+      // 占位符空框：TUI 空输入框显示提示语（mcode 的「Ask Mcode to do anything」），
+      // 框非空但内容与写入前一致 = 我们的字没落地（回车提交后框也回到同一句占位语）。
+      // 不当空框处理就会掉进下面「有内容却认不出尾字」分支，每秒盲按回车——
+      // 用户在终端里正在打的字会被这些回车抢先发出去（2026-11-10 mcode 实测报障）。
+      if (flatBox !== null && !seenInBox && flatBefore !== null && flatBox === flatBefore) flatBox = ''
       if (flatBox !== null && flatBox.includes(flatSnippet)) {
         // 尾字还在输入框里＝没提交（第一下回车被 TUI 吞了/还在粘贴合帧），再按
         seenInBox = true
@@ -457,17 +477,17 @@ export class Session extends EventEmitter {
   }
 
   /**
-   * 输入框正文（"> " 标记之后、底部分隔线之前的内容）；认不出输入框形态时返回 null。
+   * 输入框正文（提示符之后、底部分隔线之前的内容）；认不出输入框形态时返回 null。
    * 窗口取 16 行：TUI 底部还有分隔线、快捷键提示等，只取 6 行会够不着输入框。
    */
   private inputBoxText(): string | null {
     const tail = this.screenTail(16)
     let promptIdx = -1
     for (let i = 0; i < tail.length; i++) {
-      if (/^\s*[>❯](\s|$)/.test(tail[i] ?? '')) promptIdx = i
+      if (INPUT_PROMPT_RE.test(tail[i] ?? '')) promptIdx = i
     }
     if (promptIdx < 0) return null
-    const out = [(tail[promptIdx] ?? '').replace(/^\s*[>❯]\s?/, '')]
+    const out = [(tail[promptIdx] ?? '').replace(INPUT_PROMPT_STRIP_RE, '')]
     for (let i = promptIdx + 1; i < tail.length; i++) {
       const line = tail[i] ?? ''
       if (/^[─━═-]{4,}$/.test(line.trim())) break

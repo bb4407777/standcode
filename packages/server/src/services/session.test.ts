@@ -51,3 +51,95 @@ test('repeated stop leaves no orphan SIGKILL timer behind', async () => {
     session.dispose()
   }
 })
+
+// ---- 输入框识别（2026-11-10 mcode 实测：提示符是 ›，空框显示占位提示语）----
+
+const { Terminal } = createRequire(import.meta.url)('@xterm/headless') as typeof import('@xterm/headless')
+
+/** 造一屏 mcode TUI 画面（144 列，够宽不折行） */
+async function mcodeScreen(lines: string[]): Promise<InstanceType<typeof Terminal>> {
+  const term = new Terminal({ cols: 144, rows: 31, allowProposedApi: true })
+  term.write(lines.join('\r\n'))
+  await new Promise((r) => setTimeout(r, 30))
+  return term
+}
+
+const MCODE_HINT = '    Message · Enter send · Ctrl+J newline'
+const MCODE_SEPARATOR = '    ──────────────────────────────────────────'
+const MCODE_FOOTER = '  /private/tmp │ Full access │ ✦ M3.1-Flash · Effort default │ Context 512K'
+
+test('inputBoxText：认得 mcode 的 › 提示符（U+203A），尾字能对上', async () => {
+  const session = makeSession()
+  ;(session as unknown as { shadow: unknown }).shadow = await mcodeScreen([
+    MCODE_HINT,
+    MCODE_SEPARATOR,
+    '  ›  测试文字ABC',
+    MCODE_SEPARATOR,
+    '',
+    MCODE_FOOTER,
+  ])
+  const box = (session as unknown as { inputBoxText: () => string | null }).inputBoxText()
+  assert.notEqual(box, null)
+  assert.equal(box?.replace(/\s+/g, ''), '测试文字ABC')
+})
+
+test('inputBoxText：claude 系 > 提示符仍认得（回归护栏）', async () => {
+  const session = makeSession()
+  ;(session as unknown as { shadow: unknown }).shadow = await mcodeScreen(['  >  hello world'])
+  const box = (session as unknown as { inputBoxText: () => string | null }).inputBoxText()
+  assert.equal(box?.replace(/\s+/g, ''), 'helloworld')
+})
+
+test('submitUntilAccepted：mcode 占位符空框不盲按回车（终端里打的字不会被自动发送）', async () => {
+  const session = makeSession()
+  session.spawnProcess(catSpec)
+  try {
+    ;(session as unknown as { shadow: unknown }).shadow = await mcodeScreen([
+      MCODE_HINT,
+      MCODE_SEPARATOR,
+      '  ›  Ask Mcode to do anything',
+      MCODE_SEPARATOR,
+      '',
+      MCODE_FOOTER,
+    ])
+    const writes: string[] = []
+    ;(session as unknown as { pty: { write: (d: string) => void } }).pty.write = (d: string) => {
+      writes.push(d)
+    }
+    const submit = (session as unknown as {
+      submitUntilAccepted: (snippet: string, body: string, absent: boolean, boxBefore: string | null) => void
+    }).submitUntilAccepted
+    submit.call(session, '测试文字ABC', '测试文字ABC', false, 'Ask Mcode to do anything')
+    await new Promise((r) => setTimeout(r, 3500))
+    assert.equal(writes.filter((w) => w === '\r').length, 0)
+  } finally {
+    session.dispose()
+  }
+})
+
+test('submitUntilAccepted：认得输入框且尾字在框里 → 补按回车提交', async () => {
+  const session = makeSession()
+  session.spawnProcess(catSpec)
+  try {
+    ;(session as unknown as { shadow: unknown }).shadow = await mcodeScreen([
+      MCODE_HINT,
+      MCODE_SEPARATOR,
+      '  ›  测试文字ABC',
+      MCODE_SEPARATOR,
+      '',
+      MCODE_FOOTER,
+    ])
+    const writes: string[] = []
+    ;(session as unknown as { pty: { write: (d: string) => void } }).pty.write = (d: string) => {
+      writes.push(d)
+    }
+    const submit = (session as unknown as {
+      submitUntilAccepted: (snippet: string, body: string, absent: boolean, boxBefore: string | null) => void
+    }).submitUntilAccepted
+    submit.call(session, '测试文字ABC', '测试文字ABC', false, 'Ask Mcode to do anything')
+    await new Promise((r) => setTimeout(r, 1500))
+    assert.ok(writes.filter((w) => w === '\r').length >= 1)
+  } finally {
+    session.dispose()
+  }
+})

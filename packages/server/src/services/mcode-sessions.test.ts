@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
-import { mcodeEntries, readMcdeTranscript } from './mcode-sessions'
+import { claimMcodeSessionId, isMcodeSession, mcodeEntries, readMcdeTranscript, readMcodeLiveTranscript } from './mcode-sessions'
 
 const SID = 'mvs_0123456789abcdef0123456789abcdef'
 
@@ -90,4 +91,174 @@ test('mcode 正文：思考/工具/正文按段还原，空消息跳过', () => 
     else process.env.ARECO_MCODE_DB = prev
     fs.rmSync(path.dirname(file), { recursive: true, force: true })
   }
+})
+
+// ---- 座舱活会话（areco 起的 mcode 进程）----
+
+const LIVE_SID = 'mvs_1111111111111111111111111111aaaa'
+const OTHER_SID = 'mvs_2222222222222222222222222222bbbb'
+
+interface LiveRow {
+  id: string
+  cwd: string
+  createdAt: number
+  prompt?: string
+}
+
+/** 活会话夹具：本地库 + （可选）可观测目录 */
+function liveFixture(rows: LiveRow[]): { db: string; obs: string } {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'areco-mcode-live-'))
+  const db = path.join(dir, 'runtime-state.sqlite')
+  const obs = path.join(dir, 'obs')
+  fs.mkdirSync(obs)
+  const conn = new DatabaseSync(db)
+  conn.exec(`CREATE TABLE local_runtime_sessions (
+    session_id TEXT PRIMARY KEY, title TEXT, workspace_dir TEXT, project_workspace_dir TEXT,
+    created_at_ms INTEGER, updated_at_ms INTEGER)`)
+  conn.exec(`CREATE TABLE local_runtime_message_rows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, msg_id TEXT NOT NULL,
+    role TEXT, created_at_ms INTEGER NOT NULL, data_json TEXT NOT NULL)`)
+  for (const row of rows) {
+    conn
+      .prepare('INSERT INTO local_runtime_sessions VALUES (?,?,?,?,?,?)')
+      .run(row.id, null, row.cwd, row.cwd, row.createdAt, row.createdAt)
+    if (row.prompt !== undefined) {
+      conn
+        .prepare('INSERT INTO local_runtime_message_rows (session_id,msg_id,role,created_at_ms,data_json) VALUES (?,?,?,?,?)')
+        .run(row.id, `m-${row.id}`, 'user', row.createdAt, JSON.stringify({ msg_content: row.prompt }))
+    }
+  }
+  conn.close()
+  return { db, obs }
+}
+
+function withEnv<T>(env: Record<string, string | undefined>, fn: () => T): T {
+  const prev = { ...process.env }
+  for (const [k, v] of Object.entries(env)) {
+    if (v === undefined) delete process.env[k]
+    else process.env[k] = v
+  }
+  try {
+    return fn()
+  } finally {
+    for (const k of Object.keys(env)) {
+      const old = prev[k]
+      if (old === undefined) delete process.env[k]
+      else process.env[k] = old
+    }
+  }
+}
+
+test('mcode 活会话认领：cwd + 启动时间窗命中，认领到的 id 写回绑定', () => {
+  const startedAt = Date.now()
+  const { db, obs } = liveFixture([{ id: LIVE_SID, cwd: '/Users/gao', createdAt: startedAt + 3000 }])
+  try {
+    withEnv({ ARECO_MCODE_DB: db, ARECO_MCODE_OBS_DIR: obs }, () => {
+      let bound: string | null = null
+      const page = readMcodeLiveTranscript(
+        {
+          agentSessionId: null,
+          cwd: '/Users/gao',
+          startedAt,
+          createdAt: startedAt,
+          pid: null,
+          agentBindingHash: null,
+          bindAgentSession: (id) => {
+            bound = id
+          },
+        },
+        { cursor: 0 },
+      )
+      assert.equal(bound, LIVE_SID)
+      assert.equal(page.exists, true)
+    })
+  } finally {
+    fs.rmSync(path.dirname(db), { recursive: true, force: true })
+  }
+})
+
+test('mcode 活会话认领：cwd 不符 / 早于启动窗口 → 不认领', () => {
+  const startedAt = Date.now()
+  const { db, obs } = liveFixture([
+    { id: LIVE_SID, cwd: '/Users/other', createdAt: startedAt + 3000 },
+    { id: OTHER_SID, cwd: '/Users/gao', createdAt: startedAt - 600_000 },
+  ])
+  try {
+    withEnv({ ARECO_MCODE_DB: db, ARECO_MCODE_OBS_DIR: obs }, () => {
+      // cwd 是 /Users/gao 的那条创建于 10 分钟前 → 早于启动窗口，认不到
+      assert.equal(claimMcodeSessionId({ cwd: '/Users/gao', startedAt }), null)
+      // cwd 对得上、时间也在窗内 → 认到
+      assert.equal(claimMcodeSessionId({ cwd: '/Users/other', startedAt }), LIVE_SID)
+    })
+  } finally {
+    fs.rmSync(path.dirname(db), { recursive: true, force: true })
+  }
+})
+
+test('mcode 活会话认领：同 cwd 两个候选时按首条输入哈希认人', () => {
+  const startedAt = Date.now()
+  const { db, obs } = liveFixture([
+    { id: LIVE_SID, cwd: '/Users/gao', createdAt: startedAt + 2000, prompt: '第一条指令' },
+    { id: OTHER_SID, cwd: '/Users/gao', createdAt: startedAt + 4000, prompt: '另一条指令' },
+  ])
+  try {
+    withEnv({ ARECO_MCODE_DB: db, ARECO_MCODE_OBS_DIR: obs }, () => {
+      const hash = (text: string) => crypto.createHash('sha256').update(text).digest('hex')
+      assert.equal(
+        claimMcodeSessionId({ cwd: '/Users/gao', startedAt, bindingHash: hash('另一条指令') }),
+        OTHER_SID,
+      )
+      assert.equal(
+        claimMcodeSessionId({ cwd: '/Users/gao', startedAt, bindingHash: hash('第一条指令') }),
+        LIVE_SID,
+      )
+    })
+  } finally {
+    fs.rmSync(path.dirname(db), { recursive: true, force: true })
+  }
+})
+
+test('mcode 活会话正文：cursor=0 尾页、cursor>0 增量、before 向前翻页', () => {
+  const startedAt = Date.now()
+  const { db, obs } = liveFixture([{ id: LIVE_SID, cwd: '/Users/gao', createdAt: startedAt }])
+  try {
+    const conn = new DatabaseSync(db)
+    for (let i = 0; i < 3; i++) {
+      conn
+        .prepare('INSERT INTO local_runtime_message_rows (session_id,msg_id,role,created_at_ms,data_json) VALUES (?,?,?,?,?)')
+        .run(LIVE_SID, `m${i}`, i % 2 === 0 ? 'user' : 'assistant', startedAt + i, JSON.stringify({ msg_content: `第${i}条` }))
+    }
+    conn.close()
+    withEnv({ ARECO_MCODE_DB: db, ARECO_MCODE_OBS_DIR: obs }, () => {
+      const base = {
+        agentSessionId: LIVE_SID,
+        cwd: '/Users/gao',
+        startedAt,
+        createdAt: startedAt,
+        pid: null,
+        agentBindingHash: null,
+      }
+      const first = readMcodeLiveTranscript(base, { cursor: 0 })
+      assert.equal(first.messages.length, 3)
+      assert.equal(first.cursor, 3)
+      assert.equal(first.start, 0)
+      const inc = readMcodeLiveTranscript(base, { cursor: 1 })
+      assert.equal(inc.messages.length, 2)
+      assert.equal(inc.start, undefined)
+      const older = readMcodeLiveTranscript(base, { cursor: 0, before: 2 })
+      assert.equal(older.messages.length, 2)
+      assert.equal(older.start, 0)
+      assert.equal(older.hasMore, false)
+    })
+  } finally {
+    fs.rmSync(path.dirname(db), { recursive: true, force: true })
+  }
+})
+
+test('isMcodeSession：认 mcode 命令与 harness', () => {
+  assert.equal(isMcodeSession('/Users/gao/.npm-global/bin/mcode'), true)
+  assert.equal(isMcodeSession('/Users/gao/.npm-global/bin/mcode', null), true)
+  assert.equal(isMcodeSession('/bin/zsh'), false)
+  assert.equal(isMcodeSession('/Users/gao/code/areco/bin/dsh-trae-chat'), false)
+  assert.equal(isMcodeSession('/bin/zsh', 'mcode'), true)
 })

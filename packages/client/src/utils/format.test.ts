@@ -100,3 +100,16 @@ test('chatCapable：dsh 壳会话可进对话模式（trae-cn 有对话视图入
   // 偏好为终端时仍回终端页（不受此改动影响）
   assert.equal(sessionEntryPath('s1', dsh, templates, 'terminal'), '/session/s1')
 })
+
+test('chatCapable：mcode 会话可进对话模式（正文在 MiniMax 本地库）', () => {
+  const templates: Array<{ id: string; claudeHome?: string }> = [{ id: 'minimax-mcode' }]
+  const mcode = {
+    claudeSessionId: null as string | null,
+    transcriptDir: null,
+    command: '/Users/gao/.npm-global/bin/mcode',
+    templateId: 'minimax-mcode',
+  }
+  assert.equal(chatCapable(mcode, templates), true)
+  assert.equal(sessionEntryPath('s2', mcode, templates, 'chat'), '/session/s2/chat')
+  assert.equal(sessionEntryPath('s2', mcode, templates, 'terminal'), '/session/s2')
+})
