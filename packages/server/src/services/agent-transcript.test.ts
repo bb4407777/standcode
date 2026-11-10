@@ -14,6 +14,9 @@ import {
   workbuddyProjectSlugs,
   workbuddyTitle,
   workbuddyUserQuery,
+  parseDsh,
+  dshSessionIdOf,
+  dshTitle,
 } from './agent-transcript'
 
 test('codexMeta reads a session_meta line larger than 4KB', () => {
@@ -732,4 +735,100 @@ test('parsePi：user/assistant/toolResult 行 → 气泡消息，元数据行忽
   assert.equal(toolResult.text, 'boom')
   assert.equal(toolResult.isError, true)
   assert.equal(messages[0].timestamp, '2026-09-05T02:41:57.959Z')
+})
+
+// ---- dsh（dsh-trae-chat 壳 → Trae/DeepSeek）----
+
+const dshUserAuth = (text: string, time = 1792461935647) =>
+  JSON.stringify({
+    type: 'user/message', seq: 10, time,
+    data: { content: [{ type: 'text', text }], source: { kind: 'user' }, role: 'user', id: 'user-1' },
+    surfaceOp: 'append',
+  })
+
+const dshSysReminder = () =>
+  JSON.stringify({
+    type: 'user/message', seq: 11, time: 1792461935648,
+    data: {
+      content: [{ type: 'text', text: '<system-reminder>\nthe AGENTS.md instructions may be relevant\n<available_skills>…</available_skills>' }],
+      source: { kind: 'agent-instructions' }, role: 'user', id: 'sys-1',
+    },
+    surfaceOp: 'append',
+  })
+
+const dshRuntime = () =>
+  JSON.stringify({
+    type: 'user/message', seq: 12, time: 1792461935649,
+    data: { content: [{ type: 'text', text: 'Current runtime context. supersedes earlier snapshots.' }], source: { kind: 'runtime-context' }, role: 'user', id: 'rt-1' },
+    surfaceOp: 'append',
+  })
+
+const dshAssistant = () =>
+  JSON.stringify({
+    type: 'assistant/message', seq: 16, time: 1792461937644,
+    data: {
+      turn: 1, step: 1,
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: '用户想要查微信连接方式' },
+          { type: 'text', text: '我来查一下' },
+          { type: 'tool-call', id: 'call_00', name: 'bash', arguments: '{"command":"ls ~"}' },
+        ],
+        id: 'ass-1',
+      },
+    },
+    surfaceOp: 'append',
+  })
+
+const dshThinking = () =>
+  JSON.stringify({ type: 'assistant/thinking', seq: 20, time: 1792461938000, data: { text: '考虑中…' } })
+
+test('parseDsh：user/assistant/thinking → 气泡，系统注入被过滤', () => {
+  const raw = [dshUserAuth('在吗?'), dshSysReminder(), dshRuntime(), dshAssistant(), dshThinking()].join('\n')
+  const messages = parseDsh(raw)
+  // 真人 user(1) + assistant message 三块 reasoning/text/tool-call（各成一条）+ assistant/thinking(1) = 5
+  assert.equal(messages.length, 5)
+  const roles = messages.map((m) => m.role)
+  assert.ok(roles[0] === 'user' && roles[1] === 'assistant')
+  // 系统注入的 user/message 不能冒充真人 user（2026-11 高通真实测）
+  assert.equal(messages[0].parts[0].kind, 'text')
+  assert.equal((messages[0].parts[0] as { text: string }).text, '在吗?')
+  // assistant 一条 message 里的 reasoning 摘要 + text + tool-call 拆成三段
+  const asst = messages.filter((m) => m.role === 'assistant')
+  const kinds = asst.flatMap((m) => m.parts.map((p) => p.kind))
+  assert.deepEqual(kinds, ['thinking', 'text', 'tool_use', 'thinking'])
+  const toolUse = asst.flatMap((m) => m.parts).find((p) => p.kind === 'tool_use') as {
+    kind: 'tool_use'; name: string; input: string
+  }
+  assert.equal(toolUse.name, 'bash')
+  assert.ok(toolUse.input.includes('ls ~'))
+  assert.equal(messages[0].timestamp, '2026-10-20T02:05:35.647Z')
+})
+
+test('parseDsh：非 user source 一律不产出 user 气泡', () => {
+  const messages = parseDsh([dshSysReminder(), dshRuntime()].join('\n'))
+  assert.equal(messages.length, 0)
+})
+
+test('dshSessionIdOf / dshTitle 从路径与会话事件取原生 id 与标题', () => {
+  const file = '/Users/gao/.dsh/sessions/--Users-gao--/session-fc539c2e-dda3-4830-9eb4-55a46051ad12/session.v4.jsonl.zstd'
+  assert.equal(dshSessionIdOf(file), 'fc539c2e-dda3-4830-9eb4-55a46051ad12')
+  // 错误路径不误配
+  assert.equal(dshSessionIdOf('/Users/gao/.pi/agent/sessions/--x--/1_01a06f71-b4a3-7b59-a5d4-bad748fdc4ab.jsonl'), '')
+  // 标题：写临时文件让 decode 路径走系统 zstd（非 dsh 文件解码失败回空，不抛）
+  const temp = path.join(os.tmpdir(), 'areco-dsh-title.jsonl.zstd')
+  // 非 zstd 文件 decode 会失败，dshTitle 应安全回 '' 而非抛错
+  fs.writeFileSync(temp, 'not zstd data')
+  try {
+    assert.equal(dshTitle(temp), '')
+  } finally {
+    fs.rmSync(temp, { force: true })
+  }
+})
+
+test('agentKindOf：dsh 壳命令/harness → dsh', () => {
+  assert.equal(agentKindOf('/usr/local/bin/dsh-trae-chat'), 'dsh')
+  assert.equal(agentKindOf('/usr/local/bin/dsh', 'dsh'), 'dsh')
+  assert.equal(agentKindOf('dsh-trae-chat', 'dsh'), 'dsh')
 })

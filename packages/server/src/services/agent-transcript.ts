@@ -10,9 +10,13 @@
 //             （turn.prompt/steer 用户输入 + context.append_loop_event 事件流；标题在同会话目录 state.json）
 //   pi        ~/.pi/agent/sessions/<--cwd-slug-->/<本地时间戳>_<uuid>.jsonl（type=message 行，
 //             message.role=user/assistant/toolResult；首行 type=session 头含 cwd/id/timestamp）
+//   dsh       ~/.dsh/sessions/<cwd-slug>/session-<uuid>/session.v4.jsonl.zstd（zstd 压缩的
+//             type=session / turn/start / user/message / assistant/message / tool/* 等事件流，
+//             与 workbuddy harness 同构；读时经系统 zstd 解码）
 // 游标语义：消息序号（claude 路径是字节）——两者对客户端都是不透明的单调游标；
 // reasonix 的 replace 帧可能整体收缩，total < cursor 时回尾页（带 start，客户端按整页替换）。
 import fs from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import path from 'node:path'
 import os from 'node:os'
@@ -33,7 +37,7 @@ const HANDOFF_DIR = path.join(DATA_DIR, 'handoff')
 // 会话启动到 agent 建文件的宽限（agent 初始化有延迟；时钟粒度留余量）
 const BIRTH_SLACK_MS = 60_000
 
-export type AgentKind = 'codex' | 'workbuddy' | 'reasonix' | 'qclaw' | 'kimi' | 'pi'
+export type AgentKind = 'codex' | 'workbuddy' | 'reasonix' | 'qclaw' | 'kimi' | 'pi' | 'dsh'
 
 export function agentKindOf(command: string, harness?: string | null): AgentKind | null {
   if (harness === 'codex') return 'codex'
@@ -41,6 +45,7 @@ export function agentKindOf(command: string, harness?: string | null): AgentKind
   if (harness === 'reasonix') return 'reasonix'
   if (harness === 'kimi') return 'kimi'
   if (harness === 'pi') return 'pi'
+  if (harness === 'dsh') return 'dsh'
   if (harness === 'hermes') return 'qclaw'
   const base = path.basename(command)
   if (base === 'codex') return 'codex'
@@ -50,6 +55,7 @@ export function agentKindOf(command: string, harness?: string | null): AgentKind
   if (base === 'pi') return 'pi'
   if (base.startsWith('qclaw')) return 'qclaw'
   if (base === 'hermes') return 'qclaw'
+  if (base.startsWith('dsh')) return 'dsh'
   return null
 }
 
@@ -147,6 +153,21 @@ export function piSessionSlugs(cwd: string): string[] {
     /* cwd 已不存在时只用原值，恢复仍可走 agentSessionId + 历史目录兜底 */
   }
   return [...new Set(paths.map(encode))]
+}
+
+/** dsh 会话文件列举：<root>/<cwd-slug>/session-<uuid>/session.v4.jsonl.zstd */
+export function dshSessionFiles(dir: string): string[] {
+  const out: string[] = []
+  try {
+    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!ent.isDirectory() || !ent.name.startsWith('session-')) continue
+      const zp = path.join(dir, ent.name, 'session.v4.jsonl.zstd')
+      if (statSafe(zp)) out.push(zp)
+    }
+  } catch {
+    /* 目录不存在 */
+  }
+  return out
 }
 
 /**
@@ -264,7 +285,8 @@ function bindingHash(text: string): string {
 
 function firstUserText(file: string, kind: AgentKind): string {
   try {
-    const raw = fs.readFileSync(file, 'utf8')
+    const raw =
+      kind === 'dsh' ? dshRawFromCache(file) : fs.readFileSync(file, 'utf8')
     const messages =
       kind === 'codex'
         ? parseCodex(raw)
@@ -276,7 +298,9 @@ function firstUserText(file: string, kind: AgentKind): string {
               ? parseKimi(raw)
               : kind === 'pi'
                 ? parsePi(raw)
-                : parseQclaw(raw)
+                : kind === 'dsh'
+                  ? parseDsh(raw)
+                  : parseQclaw(raw)
     const first = messages.find((m) => m.role === 'user')
     return (
       first?.parts
@@ -299,11 +323,16 @@ export function piSessionIdOf(file: string): string {
   return /_([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$/.exec(file)?.[1] ?? ''
 }
 
+/** dsh 原生会话 id：<root>/<cwd-slug>/session-<uuid>/session.v4.jsonl.zstd 的 <uuid> 段 */
+export function dshSessionIdOf(file: string): string {
+  return /\/session-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\//.exec(file)?.[1] ?? ''
+}
+
 function nativeSessionId(file: string, kind: AgentKind): string {
-  if (kind === 'codex') return codexSessionIdOf(file)
   if (kind === 'reasonix') return path.basename(file, '.events.jsonl')
   if (kind === 'kimi') return kimiSessionIdOf(file)
   if (kind === 'pi') return piSessionIdOf(file)
+  if (kind === 'dsh') return dshSessionIdOf(file)
   return path.basename(file, '.jsonl')
 }
 
@@ -363,6 +392,7 @@ function agentFileTitle(file: string, kind: AgentKind): string {
     }
   }
   if (kind === 'kimi') return kimiTitleOf(file)
+  if (kind === 'dsh') return dshTitle(file)
   return ''
 }
 
@@ -684,6 +714,10 @@ function locate(session: Session, kind: AgentKind, occupied?: (nativeId: string)
     // 文件名自带 uuid（原生 id），exactAgentFile 可精确恢复；首行 session 头也含 cwd（历史层用）。
     const root = path.join(os.homedir(), '.pi', 'agent', 'sessions')
     files = piSessionSlugs(session.cwd).flatMap((slug) => listFiles(path.join(root, slug), '.jsonl'))
+  } else if (kind === 'dsh') {
+    // ~/.dsh/sessions/<cwd-slug>/session-<uuid>/session.v4.jsonl.zstd；slug 与 pi 同规则
+    const root = path.join(os.homedir(), '.dsh', 'sessions')
+    files = piSessionSlugs(session.cwd).flatMap((slug) => dshSessionFiles(path.join(root, slug)))
   } else {
     files = listFiles(path.join(os.homedir(), '.reasonix', 'sessions'), '.events.jsonl')
   }
@@ -846,6 +880,148 @@ export function parseWorkbuddy(raw: string): TranscriptMessage[] {
 /** codex 注入的 AGENTS.md/environment_context 引导消息，不是用户输入 */
 function isCodexContext(text: string): boolean {
   return text.startsWith('# AGENTS.md instructions') && text.includes('<environment_context>')
+}
+
+// ---- dsh（dsh-trae-chat 壳 → Trae/DeepSeek）----
+
+/** dsh v4 会话事件流里，真人指令的 user/message.source.kind 恒为 'user'；AGENTS.md /
+ *  运行时上下文等注入走 agent-instructions / runtime-context / skill-catalog 等其它 kind。 */
+function isDshRealUser(source: unknown): boolean {
+  return (source as { kind?: string })?.kind === 'user'
+}
+
+/** dsh 会话标题：取最新一条 type=session/title 的 data.title。 */
+export function dshTitle(file: string): string {
+  const evs = decodeDshEvents(file)
+  let title = ''
+  for (const ev of evs) {
+    if (ev.type === 'session/title') {
+      const t = ev.data?.title
+      if (typeof t === 'string' && t) title = t
+    }
+  }
+  return normalized(title)
+}
+
+/**
+ * zstd 解码 dsh 会话事件流。用系统 zstd 命令（本机 libzstd 已装）解压，未装时静默回空。
+ * 解码结果按文件 mtime+size 缓存，避免 traffic 轮询每 tick 重复解压。
+ */
+const dshDecodeCache = new Map<string, { mtimeMs: number; size: number; events: DshEvent[] }>()
+
+interface DshEvent {
+  type: string
+  data?: Record<string, unknown>
+}
+
+/** dsh 会话文件是 zstd 压缩。用系统 zstd 解压（libzstd 常驻 brew/usr/local）。launchd 的 PATH
+ *  可能比交互 shell 窄，这里按已知安装点解析成绝对路径，跑不到再退回裸命令。 */
+const ZSTD_BIN = ['/opt/homebrew/bin/zstd', '/usr/local/bin/zstd', 'zstd'].find((p) => {
+  if (p.includes('/')) {
+    try {
+      return fs.statSync(p).isFile()
+    } catch {
+      return false
+    }
+  }
+  return true // 裸命令交给 execFileSync 去 PATH 找
+})!
+
+function decodeDshEvents(file: string): DshEvent[] {
+  const st = statSafe(file)
+  if (!st || st.size === 0) return EMPTY_DSH
+  const hit = dshDecodeCache.get(file)
+  if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.events
+  let raw = ''
+  try {
+    const r = execFileSync(ZSTD_BIN, ['-dc', file], { maxBuffer: 256 * 1024 * 1024, encoding: 'utf8' })
+    raw = r
+  } catch {
+    dshDecodeCache.delete(file)
+    return EMPTY_DSH
+  }
+  const events: DshEvent[] = []
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue
+    let obj: Record<string, unknown>
+    try {
+      obj = JSON.parse(line) as Record<string, unknown>
+    } catch {
+      continue
+    }
+    events.push({ type: String(obj.type ?? ''), data: (obj.data ?? {}) as Record<string, unknown> })
+  }
+  dshDecodeCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, events })
+  return events
+}
+
+const EMPTY_DSH: DshEvent[] = []
+
+export function parseDsh(raw: string): TranscriptMessage[] {
+  const out: TranscriptMessage[] = []
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue
+    let obj: Record<string, unknown>
+    try {
+      obj = JSON.parse(line) as Record<string, unknown>
+    } catch {
+      continue
+    }
+    const type = String(obj.type ?? '')
+    const data = (obj.data ?? {}) as Record<string, unknown>
+    const ts = isoOf(obj.time) ?? isoOf(data.time)
+    if (type === 'user/message' && isDshRealUser(data.source)) {
+      const text = dshTextContent(data.content)
+      const q = workbuddyUserQuery(text)
+      if (q.trim()) out.push(msgOf('user', [textPart(q)], ts))
+    } else if (type === 'assistant/message') {
+      const msg = (data.message ?? {}) as Record<string, unknown>
+      const content = (Array.isArray(msg.content) ? msg.content : []) as Array<Record<string, unknown>>
+      for (const block of content) {
+        const btype = String(block.type ?? '')
+        if (btype === 'text') {
+          const t = String(block.text ?? '')
+          if (t.trim()) out.push(msgOf('assistant', [textPart(t)], ts))
+        } else if (btype === 'reasoning') {
+          const t = String(block.text ?? '')
+          if (t.trim()) out.push(msgOf('assistant', [{ kind: 'thinking', text: t.slice(0, MAX_PART_TEXT) }], ts))
+        } else if (btype === 'tool-call') {
+          const name = String(block.name ?? 'tool')
+          let input = ''
+          try {
+            input = typeof block.arguments === 'string' ? block.arguments : JSON.stringify(block.arguments ?? block.input ?? '', null, 2)
+          } catch {
+            input = String(block.arguments ?? '')
+          }
+          out.push(msgOf('assistant', [{ kind: 'tool_use', name, input: input.slice(0, MAX_TOOL_TEXT) }], ts))
+        }
+      }
+    } else if (type === 'assistant/thinking') {
+      const t = String(data.text ?? '')
+      if (t.trim()) out.push(msgOf('assistant', [{ kind: 'thinking', text: t.slice(0, MAX_PART_TEXT) }], ts))
+    }
+  }
+  return out
+}
+
+function dshTextContent(content: unknown): string {
+  if (!Array.isArray(content)) return ''
+  let text = ''
+  for (const b of content as Array<Record<string, unknown>>) {
+    if (b?.type === 'text') text += String(b.text ?? '')
+  }
+  return text
+}
+
+// 供 traffic 读取/历史对接：dsh 事件流（zstd 已解压的原始行）→ 转成 parseDsh 能吃的 JSONL
+function parseDshEvents(events: DshEvent[]): TranscriptMessage[] {
+  return parseDsh(events.map((e) => JSON.stringify(e)).join('\n'))
+}
+
+/** dsh 支持：traffic 读取时用解码缓存，避免每 tick spawnSync zstd。 */
+function dshRawFromCache(file: string): string {
+  const events = decodeDshEvents(file)
+  return events.map((e) => JSON.stringify(e)).join('\n')
 }
 
 export function parseCodex(raw: string): TranscriptMessage[] {
@@ -1226,7 +1402,15 @@ function parseAgentRaw(raw: string, kind: AgentKind): TranscriptMessage[] {
           ? parseKimi(raw)
           : kind === 'pi'
             ? parsePi(raw)
-            : parseReasonix(raw)
+            : kind === 'dsh'
+              ? parseDsh(raw)
+              : parseReasonix(raw)
+}
+
+/** 读 transcript 文件为明文 JSONL：workbuddy/dsh 等 zstd 压缩的先用缓存解码。 */
+function readTranscriptRaw(filePath: string, kind: AgentKind): string {
+  if (kind === 'dsh') return dshRawFromCache(filePath)
+  return fs.readFileSync(filePath, 'utf8')
 }
 
 function loadMessages(sessionId: string, filePath: string, kind: AgentKind): TranscriptMessage[] {
@@ -1234,7 +1418,7 @@ function loadMessages(sessionId: string, filePath: string, kind: AgentKind): Tra
   if (!st) return []
   const hit = parseCache.get(sessionId)
   if (hit && hit.path === filePath && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.messages
-  const messages = parseAgentRaw(fs.readFileSync(filePath, 'utf8'), kind)
+  const messages = parseAgentRaw(readTranscriptRaw(filePath, kind), kind)
   parseCache.set(sessionId, { path: filePath, mtimeMs: st.mtimeMs, size: st.size, messages })
   return messages
 }
@@ -1264,6 +1448,7 @@ export function readAgentTrafficState(
   const filePath = knownFilePath ?? locate(session, kind)
   if (!filePath) return 'working'
   if (kind === 'codex') return trafficStateFromCodex(readTailText(filePath, TRAFFIC_TAIL_BYTES))
+  if (kind === 'dsh') return trafficStateFromMessages(readAgentFileAllMessages(filePath, kind, TRAFFIC_TAIL_BYTES))
   // 走 readAgentFileAllMessages 的尾部窗口（同一套「对齐行首、丢残首行」口径），
   // 不再走 loadMessages —— 那条路的缓存对干活中的 agent 恒失效，等于每次全量读。
   return trafficStateFromMessages(readAgentFileAllMessages(filePath, kind, TRAFFIC_TAIL_BYTES))
@@ -1282,7 +1467,7 @@ export function dropAgentTranscriptCache(sessionId: string) {
  * 内容骤减、浏览器把视口钳到顶、再被拉回底，iOS 上肉眼可见），不动游标空答一轮等恢复；
  * 大亏空（真截断/文件轮换）才回尾页。reasonix replace 帧是真收缩，不在此列。
  */
-const APPEND_ONLY_KINDS: ReadonlySet<AgentKind> = new Set(['kimi', 'codex', 'qclaw', 'workbuddy', 'pi'])
+const APPEND_ONLY_KINDS: ReadonlySet<AgentKind> = new Set(['kimi', 'codex', 'qclaw', 'workbuddy', 'pi', 'dsh'])
 const JITTER_TOLERANCE = 4
 
 export function paginateMessages(
@@ -1359,6 +1544,8 @@ export function readAgentFileAllMessages(
   kind: AgentKind,
   maxBytes = 4 * 1024 * 1024
 ): TranscriptMessage[] {
+  // dsh/zstd 整文件解码（内部已有 mtime+size 缓存），无法按字节做尾部截窗；全量解析可接受。
+  if (kind === 'dsh') return parseDshEvents(decodeDshEvents(filePath))
   return parseAgentRaw(readTailText(filePath, maxBytes), kind)
 }
 

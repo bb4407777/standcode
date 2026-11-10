@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { TranscriptMessage } from '../../../shared/protocol'
 import { terminalInputStartsTask, trafficStateFromMessages } from '../../../shared/traffic'
-import { statusTagText, trafficColor } from './format'
+import { statusTagText, trafficColor, chatCapable, sessionEntryPath } from './format'
 
 function message(
   role: TranscriptMessage['role'],
@@ -84,4 +84,19 @@ test('statusTagText：黄灯（needs-user）显示「有选项」，其余口径
   assert.equal(statusTagText({ status: 'running', trafficState: 'conclusion' }), '等待中')
   assert.equal(statusTagText({ status: 'running', trafficState: 'working' }), '运行中')
   assert.equal(statusTagText({ status: 'exited', trafficState: 'exited' }), '已退出')
+})
+
+test('chatCapable：dsh 壳会话可进对话模式（trae-cn 有对话视图入口）', () => {
+  const templates: Array<{ id: string; claudeHome?: string }> = [{ id: 'trae-cn' }]
+  const dsh = {
+    claudeSessionId: null as string | null,
+    transcriptDir: null,
+    command: '/Users/gao/code/areco/bin/dsh-trae-chat',
+    templateId: 'trae-cn',
+  }
+  assert.equal(chatCapable(dsh, templates), true)
+  // 默认「对话模式」偏好 → 看板/侧栏点卡片路由到 chat 页
+  assert.equal(sessionEntryPath('s1', dsh, templates, 'chat'), '/session/s1/chat')
+  // 偏好为终端时仍回终端页（不受此改动影响）
+  assert.equal(sessionEntryPath('s1', dsh, templates, 'terminal'), '/session/s1')
 })

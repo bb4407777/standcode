@@ -125,7 +125,7 @@ export function sourceColor(
 }
 
 /** 座舱有对话视图的会话：claude 系（结构化 transcript），或直读自家落盘的 agent */
-const CHAT_CAPABLE_COMMANDS = new Set(['codex', 'codebuddy', 'reasonix', 'kimi', 'pi'])
+const CHAT_CAPABLE_COMMANDS = new Set(['codex', 'codebuddy', 'reasonix', 'kimi', 'pi', 'mcode'])
 
 export function chatCapable(
   session: { claudeSessionId: string | null; transcriptDir?: string | null; command: string; templateId: string },
@@ -136,6 +136,8 @@ export function chatCapable(
   if (session.transcriptDir) return true
   const base = session.command.split('/').pop() ?? ''
   if (CHAT_CAPABLE_COMMANDS.has(base)) return true
+  // dsh-trae-chat 等 dsh 壳：落盘 ~/.dsh/sessions，服务端按 dsh harness 解析（与 basename.startsWith('dsh') 同口径）
+  if (base.startsWith('dsh')) return true
   // claude 包装器会话缺 claudeSessionId（模板 claudeHome 曾丢失）：模板配了 claudeHome 即可走服务端窗口定位
   return Boolean(templates?.find((t) => t.id === session.templateId)?.claudeHome)
 }
