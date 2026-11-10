@@ -2,10 +2,11 @@
 // prompt 输入：自动增高 textarea（文本多了完整换行显示），Enter 发送/Shift+Enter 换行，IME isComposing 防误发，本地历史上翻
 // 附件：📎 选文件/整卡拖拽 → 上传落盘 Mac（data/uploads/<日期>/）→ 绝对路径回填输入框，agent 拿路径即可读
 // 拖文件夹不上传内容：服务端 Spotlight 按名定位源目录路径回填（见 useFileDrop）
-import { ref, watch, nextTick } from 'vue'
+import { ref, watch, nextTick, onBeforeUnmount } from 'vue'
 import { useMessage } from 'naive-ui'
 import { wsClient } from '../ws'
 import { useUiStore } from '../stores/ui'
+import { useSpeechStore } from '../stores/speech'
 import { useFileDrop } from '../composables/useFileDrop'
 import { useVoiceDictation } from '../composables/useVoiceDictation'
 import FileDropOverlay from './FileDropOverlay.vue'
@@ -65,6 +66,8 @@ const {
   listening: voiceListening,
   starting: voiceStarting,
   toggle: toggleVoice,
+  start: startVoice,
+  stop: stopVoice,
 } = useVoiceDictation({
   getText: () => text.value,
   setText: (value) => {
@@ -79,12 +82,56 @@ const {
 })
 
 async function onMicClick() {
+  // 手动点按钮＝用户自己掌机：取消「播报结束自动续听」，免得松手后又被拉起来
+  pausedBySpeech = false
+  if (resumeTimer !== null) {
+    clearTimeout(resumeTimer)
+    resumeTimer = null
+  }
   try {
     await toggleVoice()
   } catch (err) {
     message.error(err instanceof Error ? err.message : String(err))
   }
 }
+
+// 播报期间暂停收音：TTS 从扬声器出来会被麦克风原样录回去（自问自答 + 打断），
+// 念完再自动恢复——这就是 Hermes-live 那套半双工，用户全程不用碰屏幕
+const speech = useSpeechStore()
+let pausedBySpeech = false
+let resumeTimer: number | null = null
+
+watch(
+  () => speech.playingId,
+  (playingId) => {
+    if (resumeTimer !== null) {
+      clearTimeout(resumeTimer)
+      resumeTimer = null
+    }
+    if (playingId) {
+      if (voiceListening.value && !voiceStarting.value) {
+        pausedBySpeech = true
+        void stopVoice()
+      }
+      return
+    }
+    if (!pausedBySpeech) return
+    // 句与句之间 playingId 会短暂清零，等一拍再收口，别把正常停顿当成播完
+    resumeTimer = window.setTimeout(() => {
+      resumeTimer = null
+      if (!pausedBySpeech) return
+      pausedBySpeech = false
+      if (props.disabled || voiceListening.value || voiceStarting.value) return
+      void startVoice().catch((err) => {
+        message.error(err instanceof Error ? err.message : String(err))
+      })
+    }, 450)
+  },
+)
+
+onBeforeUnmount(() => {
+  if (resumeTimer !== null) clearTimeout(resumeTimer)
+})
 
 // 文件拖放/选件上传（document 级拖放 + 文件夹递归 + 落盘回填），逻辑在 useFileDrop
 const { dragging, uploading, fileInputEl, pickFiles, onInputChange } = useFileDrop({
