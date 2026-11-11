@@ -2,9 +2,9 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { terminalThemeFor } from './terminalTheme'
 
-test('terminalThemeFor：mcode 强制深色终端底（白底上正文对比度仅 1.45，看不清）', () => {
-  assert.equal(terminalThemeFor('/Users/gao/.npm-global/bin/mcode', 'light'), 'dark')
-  assert.equal(terminalThemeFor('/Users/gao/.npm-global/bin/mcode', 'dark'), 'dark')
+test('terminalThemeFor：mcode 恒定浅底（服务端按浅底配色注入 COLORFGBG，两边必须一致）', () => {
+  assert.equal(terminalThemeFor('/Users/gao/.npm-global/bin/mcode', 'light'), 'light')
+  assert.equal(terminalThemeFor('/Users/gao/.npm-global/bin/mcode', 'dark'), 'light')
 })
 
 test('terminalThemeFor：其他 agent 跟随 areco 全局主题', () => {

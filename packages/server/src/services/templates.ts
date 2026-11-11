@@ -157,9 +157,11 @@ export function buildSpawnSpec(
     }
   }
   // mcode 靠 OSC 11 / COLORFGBG 探测终端底色：xterm.js 不应答 OSC 11，它会 fallback 深色
-  // （自绘配色按深底设计，白底上正文对比度只有 1.45）。客户端对这类 agent 强制深色终端，
-  // 这里再明确告知「终端是深底」，两边一致——免得将来 mcode 探测逻辑变了配色与底色错配。
-  if (isMcodeSession(template.command, template.harness)) env.COLORFGBG = '15;0'
+  // （深色配色正文 rgb(214,214,214) 在白底上对比度只有 1.45，几乎看不见——2026-11-10 实测）。
+  // 明确告知「终端是浅底」（COLORFGBG 末段=15 → mcode 判 light → 浅色配色，
+  // 正文 rgb(48,48,48) 在白底上对比度 13.2）。客户端对这类 agent 恒定浅色终端底，
+  // 两边恒定一致，不会因 areco 主题变化而错配。
+  if (isMcodeSession(template.command, template.harness)) env.COLORFGBG = '0;15'
   // harness.pre：exec 前的前置命令（如 reasonix 的 config auto-plan on），
   // 原样拼接——来源是本机 standcode/config 配置文件，与 command 同信任级。
   const script = resolved?.pre?.length

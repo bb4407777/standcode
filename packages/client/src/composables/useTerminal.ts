@@ -64,9 +64,9 @@ const LIGHT_TERM_THEME = {
 export function useTerminal(sessionId: string) {
   const ui = useUiStore()
   const sessions = useSessionsStore()
-  // 该会话的 agent 是否只渲染深色配色 → 终端底强制深色（不跟 areco 全局浅/深主题）
-  const darkOnlyTerminal = computed(
-    () => terminalThemeFor(sessions.byId(sessionId)?.command, 'light') === 'dark',
+  // 终端底按会话判定：mcode 恒定浅底（与它自绘的浅色配色配套），其余跟随 areco 全局主题
+  const fixedLightTerminal = computed(
+    () => terminalThemeFor(sessions.byId(sessionId)?.command, 'light') === 'light',
   )
   const themeFor = (mode: 'dark' | 'light') =>
     terminalThemeFor(sessions.byId(sessionId)?.command, mode) === 'dark'
@@ -810,8 +810,8 @@ export function useTerminal(sessionId: string) {
     term.options.theme = themeFor(mode)
   }
 
-  // 会话信息后到（store 异步）时补一次主题纠正：深色专属 agent 落到浅色终端上就是看不清
-  watch(darkOnlyTerminal, () => {
+  // 会话信息后到（store 异步）时补一次主题纠正：终端底与 agent 自绘配色不一致就是看不清
+  watch(fixedLightTerminal, () => {
     if (term) term.options.theme = themeFor(ui.theme)
   })
 
