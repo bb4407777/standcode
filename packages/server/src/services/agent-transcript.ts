@@ -1470,6 +1470,21 @@ export function dropAgentTranscriptCache(sessionId: string) {
 const APPEND_ONLY_KINDS: ReadonlySet<AgentKind> = new Set(['kimi', 'codex', 'qclaw', 'workbuddy', 'pi', 'dsh'])
 const JITTER_TOLERANCE = 4
 
+/**
+ * 尾页取尾 80 条；若这 80 条全是 assistant/tool 过程块、把最后一条真人输入挤在 80 条之外，
+ * 对话模式首屏就看不到用户自己刚发的字（"我的输入没显示" 报障，2026-11-10）。
+ * 解法：真人输入在外时，把窗口起点上推到「最后一条真人输入」处——保证首屏必含最近一次输入，
+ * 代价是最多多带一些消息；增量（cursor>0）与向前翻页（before）不受影响。
+ * 真人输入口径＝role==='user' 且有 text 段（notice/tool_result 等合成 user 行无 text，不算）。
+ */
+function nearestLastUserStart(messages: TranscriptMessage[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m.role === 'user' && m.parts.some((p) => p.kind === 'text')) return i
+  }
+  return -1
+}
+
 export function paginateMessages(
   messages: TranscriptMessage[],
   kind: AgentKind,
@@ -1483,7 +1498,10 @@ export function paginateMessages(
   }
   const jitter = APPEND_ONLY_KINDS.has(kind) && total < opts.cursor && opts.cursor - total <= JITTER_TOLERANCE
   if (opts.cursor === 0 || (total < opts.cursor && !jitter)) {
-    const start = Math.max(0, total - PAGE_MESSAGES)
+    let start = Math.max(0, total - PAGE_MESSAGES)
+    // 真人输入在 80 条窗口之外 → 窗口上推到它（保证首屏可见最近输入）
+    const lastUser = nearestLastUserStart(messages)
+    if (lastUser < start) start = Math.max(0, lastUser)
     return { exists: true, messages: messages.slice(start), cursor: total, start, hasMore: start > 0 }
   }
   if (total < opts.cursor) return { exists: true, messages: [], cursor: opts.cursor } // 抖动：游标不动，空答等恢复

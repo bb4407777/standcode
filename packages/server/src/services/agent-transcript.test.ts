@@ -582,6 +582,41 @@ test('paginateMessages：追加型小亏空容差（空答不动游标），大�
   assert.equal(rx.cursor, 28)
 })
 
+test('paginateMessages：尾页保证含最近真人输入（"我的输入没显示"报障）', () => {
+  // 模拟长会话：最早的几条是真人输入，之后 agent 一口气产生 100+ 条助手气泡，
+  // 尾 80 条窗口恰好全是 assistant —— 修复前沿页不含用户输入，修复后窗口上推到最近输入
+  const userMsg = (i: number) => ({ role: 'user' as const, parts: [{ kind: 'text' as const, text: `用户输入${i}` }], timestamp: null })
+  const asstMsg = (i: number) => ({ role: 'assistant' as const, parts: [{ kind: 'text' as const, text: `助手输出${i}` }], timestamp: null })
+  const msgs: TranscriptMessage[] = [
+    userMsg(0), asstMsg(1), userMsg(2), asstMsg(3), userMsg(4), asstMsg(5), userMsg(6),
+    ...Array.from({ length: 120 }, (_, i) => asstMsg(7 + i)),
+  ]
+  // total=127，最近真人输入在 index 6，尾 80 条窗口 start=47 —— 本不含 index 6
+  const page = paginateMessages(msgs, 'dsh', { cursor: 0 })
+  assert.equal(page.start, 6)
+  assert.equal(page.messages[0], msgs[6]) // 首条即最近真人输入
+  assert.equal(page.messages.some((m) => m.role === 'user'), true)
+  assert.equal(page.hasMore, true)
+  assert.equal(page.cursor, msgs.length)
+})
+
+test('paginateMessages：真人输入未超出窗口时尾页不动', () => {
+  const mk = (role: 'user' | 'assistant', i: number) => ({
+    role: role as 'user' | 'assistant',
+    parts: [{ kind: 'text' as const, text: `${role}${i}` }],
+    timestamp: null,
+  })
+  // 真人输入在窗口内（index 79），无需上推
+  const msgs: TranscriptMessage[] = [
+    ...Array.from({ length: 79 }, (_, i) => mk('assistant', i)),
+    mk('user', 0),
+    ...Array.from({ length: 20 }, (_, i) => mk('assistant', 1000 + i)),
+  ]
+  const page = paginateMessages(msgs, 'dsh', { cursor: 0 })
+  assert.equal(page.start, msgs.length - 80)
+  assert.equal(page.messages.includes(msgs[79]), true)
+})
+
 test('kimi traffic：尾条 assistant 纯文本判绿、尾条 tool.call 判红', () => {  const done = [
     K({ type: 'turn.prompt', input: [{ type: 'text', text: '干活' }], time: 1000 }),
     K({ type: 'context.append_loop_event', event: { type: 'content.part', part: { type: 'text', text: '干完了。' } }, time: 2000 }),

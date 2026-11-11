@@ -361,7 +361,15 @@ function mcodeSessionExists(id: string): boolean {
 /**
  * 游标语义＝消息序号（与 agent-transcript 的消息序号游标同口径，客户端只当不透明单调游标用）：
  *  cursor=0 → 尾页（带 start，整页替换）；cursor>0 → 增量追加；before=N → 更早一页。
+ *  尾页保证含最近真人输入（"我的输入没显示"报障，2026-11-10，与 agent-transcript 同口径）。
  */
+function nearestLastUserStart(messages: TranscriptMessage[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m.role === 'user' && m.parts.some((p) => p.kind === 'text')) return i
+  }
+  return -1
+}
 function paginateMcode(messages: TranscriptMessage[], opts: { cursor: number; before?: number }): TranscriptPage {
   const total = messages.length
   if (opts.before !== undefined) {
@@ -370,7 +378,10 @@ function paginateMcode(messages: TranscriptMessage[], opts: { cursor: number; be
     return { exists: true, messages: messages.slice(start, end), cursor: end, start, hasMore: start > 0 }
   }
   if (opts.cursor === 0 || total < opts.cursor) {
-    const start = Math.max(0, total - PAGE_MESSAGES)
+    let start = Math.max(0, total - PAGE_MESSAGES)
+    // 真人输入在 80 条窗口之外 → 窗口上推到它（保证首屏可见最近输入）
+    const lastUser = nearestLastUserStart(messages)
+    if (lastUser < start) start = Math.max(0, lastUser)
     return { exists: true, messages: messages.slice(start), cursor: total, start, hasMore: start > 0 }
   }
   return { exists: true, messages: messages.slice(opts.cursor), cursor: total }
