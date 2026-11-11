@@ -175,6 +175,83 @@ const updatedAt = computed(() =>
   snap.value ? new Date(snap.value.ts).toLocaleTimeString('zh-CN', { hour12: false }) : '—'
 )
 
+/* ---------- 各轨积分（opc 采集器写的快照，服务器只读） ---------- */
+const creditsRefreshing = ref(false)
+/** 积分读数：余额优先，无余额则报今日额度 */
+function creditsText(t: OpcTrackRow): string {
+  const c = t.credits
+  if (!c) return '—'
+  if (c.error) return c.error === '未登录' ? '未登录' : '取数失败'
+  if (c.exhausted) return '已用尽'
+  if (c.balance !== null && c.balance !== undefined) {
+    const unit = c.unit || '积分'
+    return c.total !== null && c.total !== undefined
+      ? `余额 ${fmtNum(c.balance)}／${fmtNum(c.total)} ${unit}`
+      : `余额 ${fmtNum(c.balance)} ${unit}`
+  }
+  if (c.daily !== null && c.daily !== undefined) {
+    return `今日 ${fmtNum(c.daily)} ${c.unit || '积分'}${c.dailyClaimed ? ' · 已领' : ' · 未领'}`
+  }
+  return '—'
+}
+function fmtNum(n: number): string {
+  return Number.isInteger(n) ? String(n) : n.toFixed(2)
+}
+/** 手机端紧凑读数：余额数字，或今日额度（✓＝已领） */
+function creditsShort(t: OpcTrackRow): string {
+  const c = t.credits
+  if (!c || c.error) return c?.error === '未登录' ? '未登录' : '—'
+  if (c.exhausted) return '用尽'
+  if (c.balance !== null && c.balance !== undefined) return fmtNum(c.balance)
+  if (c.daily !== null && c.daily !== undefined) return `${fmtNum(c.daily)}${c.dailyClaimed ? '✓' : ''}`
+  return '—'
+}
+/** 积分读数的状态色：余额低于 20% 转黄，低于 5% 转红（只有报了总额才算比例） */
+function creditsLevel(t: OpcTrackRow): 'ok' | 'warn' | 'bad' | 'none' {
+  const c = t.credits
+  if (!c || c.error) return 'none'
+  if (c.exhausted) return 'bad'
+  if (c.balance !== null && c.balance !== undefined && c.total) {
+    const r = c.balance / c.total
+    if (r < 0.05) return 'bad'
+    if (r < 0.2) return 'warn'
+  }
+  return 'ok'
+}
+function creditsTip(t: OpcTrackRow): string {
+  const c = t.credits
+  if (!c) return '暂无积分数据'
+  const lines = [`账户面 ${c.platform}`]
+  if (c.total !== null && c.total !== undefined && c.used !== null && c.used !== undefined) {
+    lines.push(`总额 ${fmtNum(c.total)} · 已用 ${fmtNum(c.used)} · 余额 ${fmtNum(c.balance ?? 0)}`)
+  } else if (c.balance !== null && c.balance !== undefined) {
+    lines.push(`余额 ${fmtNum(c.balance)}`)
+  }
+  if (c.purchased !== null && c.purchased !== undefined) {
+    lines.push(`买断 ${fmtNum(c.purchased)} · 赠送 ${fmtNum(c.free ?? 0)}`)
+  }
+  if (c.exhausted) lines.push('额度已用尽')
+  if (c.daily !== null && c.daily !== undefined) {
+    lines.push(`今日额度 ${fmtNum(c.daily)} ${c.unit}${c.dailyClaimed ? '（已领）' : '（未领）'}`)
+  }
+  if (c.note) lines.push(c.note)
+  if (c.error) lines.push(`取数失败：${c.error}`)
+  lines.push(`来源 ${c.source}`)
+  if (c.ts) lines.push(`采集于 ${new Date(c.ts).toLocaleString('zh-CN', { hour12: false })}`)
+  return lines.join('\n')
+}
+async function refreshCredits(): Promise<void> {
+  creditsRefreshing.value = true
+  try {
+    await api.post('/api/opc/credits/refresh')
+    await refresh()
+  } catch (err) {
+    message.error(`积分刷新失败：${(err as Error).message}`)
+  } finally {
+    creditsRefreshing.value = false
+  }
+}
+
 /** 选中项：先找在办工单，再找跑单 */
 const selectedTask = computed<OpcTaskRow | null>(() => (snap.value?.tasks ?? []).find((t) => t.id === selectedId.value) ?? null)
 const selectedRun = computed<OpcRun | null>(() => (snap.value?.runs ?? []).find((r) => r.taskId === selectedId.value) ?? null)
@@ -509,10 +586,11 @@ onUnmounted(() => {
           :key="t.id"
           class="chip"
           :class="t.status"
-          :title="`${t.label}\n模型 ${t.model || '账户默认'}\n${trackState(t)}`"
+          :title="`${t.label}\n模型 ${t.model || '账户默认'}\n${trackState(t)}\n积分 ${creditsText(t)}`"
         >
           <span class="chip-name">{{ t.id }}</span>
           <span class="chip-used">{{ t.usedToday }}</span>
+          <span class="chip-credits" :class="creditsLevel(t)">{{ creditsShort(t) }}</span>
         </span>
       </div>
 
@@ -748,6 +826,9 @@ onUnmounted(() => {
         <div class="ov-head">
           <h2 class="ov-title">轨道健康</h2>
           <span class="hint">读失败不写冷却；额度/限流才冷却，到期自动恢复</span>
+          <button type="button" class="link ov-refresh" :disabled="creditsRefreshing" @click="refreshCredits">
+            {{ creditsRefreshing ? '取数中…' : '刷新积分' }}
+          </button>
         </div>
         <div class="tracks">
           <div
@@ -761,6 +842,7 @@ onUnmounted(() => {
             <span class="track-model mono">{{ t.model || '账户默认' }}</span>
             <span class="track-state">{{ trackState(t) }}</span>
             <span class="track-used">今日 {{ t.usedToday }} 单</span>
+            <span class="track-credits" :class="creditsLevel(t)" :title="creditsTip(t)">{{ creditsText(t) }}</span>
           </div>
           <div v-if="!snap?.tracks.length" class="empty">轨道表读取中…</div>
         </div>
@@ -1158,7 +1240,7 @@ onUnmounted(() => {
 }
 .track {
   display: grid;
-  grid-template-columns: 150px minmax(0, 1fr) 96px 76px;
+  grid-template-columns: 150px minmax(0, 1fr) 96px 76px minmax(120px, 168px);
   align-items: center;
   gap: 10px;
   border: 1px solid var(--border);
@@ -1196,6 +1278,41 @@ onUnmounted(() => {
   text-align: right;
   color: var(--faint);
   font-variant-numeric: tabular-nums;
+}
+/* 各轨账户积分：余额优先，无余额则报今日额度；低余额转黄/红 */
+.track-credits {
+  text-align: right;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.track-credits.warn {
+  color: #e8a33d;
+}
+.track-credits.bad {
+  color: var(--danger);
+}
+.track-credits.none {
+  color: var(--faint);
+}
+.chip-credits {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.chip-credits.warn {
+  color: #e8a33d;
+}
+.chip-credits.bad {
+  color: var(--danger);
+}
+.chip-credits.none {
+  color: var(--faint);
+}
+.ov-refresh {
+  margin-left: auto;
 }
 .select-hint {
   margin: 8px 0 0;

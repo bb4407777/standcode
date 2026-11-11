@@ -27,6 +27,8 @@
 - 测试：`npm test`（tsx --test，含服务端/客户端/共享层）；类型检查即构建前置。
 - 部署：`./start.sh restart`（launchd com.areco 已接管，脚本自动转发 kickstart）；
   生产 8790 可能有用户在舱内开着的会话，重启前先 `/api/sessions` 看一眼。
+- **不自己重启**（2026-11-11 高律师令「下次不要自己重启」）：改动只汇报、只构建，
+  重启时机由高律师定；确有紧急理由也先问一句，别顺手 kickstart。
 - shell 脚本：macOS 系统 bash 3.2 下 `$VAR` 后紧跟中文/全角字符会把首字节
   粘进变量名（set -u 直接炸）——变量后接 CJK 一律写 `${VAR}`。
 - `config.json`、`data/`、`bin/` 是 gitignore 的本机私有物，不入仓。

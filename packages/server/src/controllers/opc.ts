@@ -1,11 +1,23 @@
-// OPC 后台页控制器：快照 + 单工单日志尾部 + 常驻会话对话（派单）
+// OPC 后台页控制器：快照 + 单工单日志尾部 + 常驻会话对话（派单）+ 积分刷新
 import type { Context } from 'koa'
-import { sendSessionMessage, snapshot, taskLog } from '../services/opc'
+import { refreshCredits, sendSessionMessage, snapshot, taskLog } from '../services/opc'
 
 export class OpcControllers {
   list = async (ctx: Context) => {
     ctx.set('Cache-Control', 'no-store')
     ctx.body = { ok: true, data: snapshot() }
+  }
+
+  /** 手动刷新各轨积分：跑一次 opc 采集器（只读平台接口） */
+  refreshCredits = async (ctx: Context) => {
+    try {
+      ctx.set('Cache-Control', 'no-store')
+      const r = refreshCredits()
+      ctx.body = { ok: r.ok, data: r.credits, error: r.error ?? '' }
+    } catch (err) {
+      ctx.status = 500
+      ctx.body = { ok: false, error: { code: 'credits_refresh_failed', message: (err as Error).message } }
+    }
   }
 
   taskLog = async (ctx: Context) => {

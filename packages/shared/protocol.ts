@@ -609,6 +609,38 @@ export interface OpcTaskRow {
 
 export type OpcTrackStatus = 'ok' | 'closed' | 'cooldown' | 'missing'
 
+/** 轨的账户积分（opc 采集器 track-credits.mjs 写 data/track-credits.json） */
+export interface OpcTrackCredits {
+  /** 账户面：workbuddy / workbuddy-ai / trae / qoder-cn / qoder-global / minimax */
+  platform: string
+  /** 账户余额（该平台没有余额端点时为 null） */
+  balance: number | null
+  /** 总额（只有 Trae 报得出） */
+  total: number | null
+  /** 已用（只有 Trae 报得出） */
+  used: number | null
+  /** 今日可得额度 */
+  daily: number | null
+  /** 今日额度是否已领 */
+  dailyClaimed: boolean | null
+  /** 买断部分剩余（MiniMax 口径） */
+  purchased: number | null
+  /** 赠送部分剩余（MiniMax 口径） */
+  free: number | null
+  /** 额度是否已用尽（Qoder 的 isQuotaExceeded） */
+  exhausted: boolean | null
+  /** 单位：积分 / 积分·日 */
+  unit: string
+  /** 口径说明 */
+  note: string
+  /** 取数来源 */
+  source: string
+  /** 取数失败原因（空＝正常） */
+  error: string
+  /** 采集时间 */
+  ts: string
+}
+
 export interface OpcTrackRow {
   id: string
   label: string
@@ -626,6 +658,8 @@ export interface OpcTrackRow {
   lastProbe: string
   lastErrorKind: string
   lastError: string
+  /** 账户积分（取不到时为 undefined，界面显示 —） */
+  credits?: OpcTrackCredits
 }
 
 /** 常驻会话岗（depts.json standing_session=true）：同轨续用一条会话，换轨才新开 */

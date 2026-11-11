@@ -74,6 +74,8 @@ export function createApiRouter(
   router.get('/opc', oc.list)
   router.get('/opc/tasks/:id/log', oc.taskLog)
   router.post('/opc/sessions/:dept/message', oc.sessionMessage)
+  // 2026-11-11 各轨积分：手动刷新一次采集器（只读平台接口）
+  router.post('/opc/credits/refresh', oc.refreshCredits)
 
   // Hermes 微信会话只读视图（作业单 A，2026-08-04）：只读 state.db，不回填本地表。
   // 独立 controller 模块（不并入 ApiControllers），仅新增只读端点，不改既有路由/控制器。

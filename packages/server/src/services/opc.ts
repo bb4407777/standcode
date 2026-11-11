@@ -10,7 +10,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { DatabaseSync } from 'node:sqlite'
-import type { OpcRun, OpcSessionRow, OpcSnapshot, OpcTaskLog, OpcTaskRow, OpcTrackRow } from '../../../shared/protocol'
+import type { OpcRun, OpcSessionRow, OpcSnapshot, OpcTaskLog, OpcTaskRow, OpcTrackCredits, OpcTrackRow } from '../../../shared/protocol'
 
 const RUN_LIMIT = 200
 const TASK_LIMIT = 120
@@ -78,6 +78,12 @@ interface RawTrack {
 interface RawTracksFile {
   tracks?: Record<string, RawTrack>
   default_prefs?: string[]
+}
+
+/** opc 采集器写的积分快照（scripts/track-credits.mjs → data/track-credits.json） */
+interface RawCreditsFile {
+  ts?: string
+  tracks?: Record<string, OpcTrackCredits>
 }
 
 export function parseRun(value: unknown): OpcRun | null {
@@ -220,9 +226,35 @@ function dailyOpenAt(def: RawTrack, now: number): number {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate(), h, m, 0, 0).getTime()
 }
 
+/** 读积分快照（没有快照文件时返回空表，界面显示 —） */
+export function readCredits(): Record<string, OpcTrackCredits> {
+  const file = readJson<RawCreditsFile>(path.join(opcRoot(), 'data', 'track-credits.json'))
+  return file?.tracks ?? {}
+}
+
+/**
+ * 手动刷新积分：跑一次 opc 采集器（scripts/track-credits.mjs），再读回快照。
+ * 采集器只读各平台接口，不签到、不消耗额度；失败时抛错，前端提示即可。
+ */
+export function refreshCredits(): { ok: boolean; error?: string; credits: Record<string, OpcTrackCredits> } {
+  const script = path.join(opcRoot(), 'scripts', 'track-credits.mjs')
+  if (!fs.existsSync(script)) {
+    return { ok: false, error: `采集器不在：${script}`, credits: readCredits() }
+  }
+  const r = spawnSync(process.execPath, [script], {
+    cwd: opcRoot(), encoding: 'utf8', timeout: 90_000,
+  })
+  if (r.status !== 0) {
+    const why = (r.stderr || r.stdout || `退出码 ${r.status}`).trim().split('\n').slice(-1)[0] ?? ''
+    return { ok: false, error: why.slice(0, 200), credits: readCredits() }
+  }
+  return { ok: true, credits: readCredits() }
+}
+
 function readTracks(usedToday: Record<string, number> = {}): OpcTrackRow[] {
   const file = readJson<RawTracksFile>(path.join(opcRoot(), 'config', 'tracks.json'))
   const health = readJson<Record<string, RawTrackHealth>>(path.join(opcRoot(), 'data', 'track-health.json')) ?? {}
+  const credits = readCredits()
   const defs = file?.tracks ?? {}
   const order = (file?.default_prefs ?? []).filter((id) => defs[id])
   for (const id of Object.keys(defs)) if (!order.includes(id)) order.push(id)
@@ -257,6 +289,7 @@ function readTracks(usedToday: Record<string, number> = {}): OpcTrackRow[] {
       lastProbe: h?.last_probe ?? '',
       lastErrorKind,
       lastError: h?.last_error ?? '',
+      credits: credits[id],
     }
   })
 }
